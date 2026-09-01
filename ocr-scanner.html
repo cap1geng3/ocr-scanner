@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<meta name="theme-color" content="#101828">
+<title>OCR สแกนเอกสาร</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     CONFIG SERVER — แก้ไขค่าทั้งหมดได้ที่บล็อกนี้
+     (ค่าที่แก้ผ่านหน้า "ตั้งค่า" ในแอปจะถูกเก็บใน localStorage
+      และใช้แทนค่าด้านล่างนี้ ปุ่ม "คืนค่าเริ่มต้น" จะกลับมาใช้ค่านี้)
+     ═══════════════════════════════════════════════════════════════════ -->
+<script>
+window.APP_CONFIG = {
+
+  /* ── โหมดทำงาน ──────────────────────────────────────────────
+     "demo" = ไม่เรียกเซิร์ฟเวอร์ ใช้ข้อมูลตัวอย่าง (สำหรับทดลอง UI)
+     "live" = เรียก OCR API และ Database API จริงตามค่าด้านล่าง      */
+  mode: "demo",
+
+  /* ── เซิร์ฟเวอร์ OCR ───────────────────────────────────────── */
+  ocr: {
+    endpoint: "https://your-server.example.com/api/ocr",
+    method: "POST",
+    // "json"      → ส่ง { image: "<base64>", doc_type: "...", lang: "tha+eng" }
+    // "multipart" → ส่ง FormData: file, doc_type, lang
+    payload: "json",
+    apiKey: "",                       // ใส่ token; ส่งเป็น Authorization: Bearer <apiKey>
+    headerName: "Authorization",
+    headerPrefix: "Bearer ",
+    lang: "tha+eng",
+    timeoutMs: 60000
+  },
+
+  /* ── เซิร์ฟเวอร์ฐานข้อมูล (Insert) ───────────────────────────── */
+  db: {
+    endpoint: "https://your-server.example.com/api/documents",
+    method: "POST",
+    apiKey: "",
+    headerName: "Authorization",
+    headerPrefix: "Bearer ",
+    table: "documents",               // ส่งไปกับ payload เพื่อให้ backend รู้ตารางเป้าหมาย
+    itemsTable: "document_items"
+  },
+
+  /* ── เกณฑ์ตรวจสอบ ─────────────────────────────────────────── */
+  review: {
+    lowConfidence: 0.85,              // ต่ำกว่านี้ = ทำเครื่องหมาย "ต้องตรวจสอบ"
+    blockSaveOnLow: false,            // true = ห้ามบันทึกจนกว่าจะยืนยันฟิลด์ที่มั่นใจต่ำ
+    imageMaxWidth: 2000,              // ย่อภาพก่อนส่ง (px) ลดเวลาอัปโหลด
+    jpegQuality: 0.9
+  },
+
+  /* ── กล้อง ────────────────────────────────────────────────── */
+  camera: { facingMode: "environment", idealWidth: 1920, idealHeight: 2560 },
+
+  /* ── แม่แบบเอกสาร: กำหนดฟิลด์และคอลัมน์ในฐานข้อมูล ──────────────
+     key  = ชื่อคอลัมน์ที่จะ insert
+     type = text | number | date
+     lineItems = true ถ้าเอกสารมีตารางรายการสินค้า                   */
+  templates: [
+    {
+      id: "tax_invoice", name: "ใบกำกับภาษี", lineItems: true,
+      fields: [
+        { key: "doc_no",        label: "เลขที่เอกสาร",            type: "text" },
+        { key: "doc_date",      label: "วันที่เอกสาร",             type: "date" },
+        { key: "vendor_name",   label: "ชื่อผู้ขาย",               type: "text" },
+        { key: "vendor_tax_id", label: "เลขประจำตัวผู้เสียภาษี",    type: "text" },
+        { key: "subtotal",      label: "ยอดก่อนภาษี",             type: "number" },
+        { key: "vat_amount",    label: "ภาษีมูลค่าเพิ่ม 7%",        type: "number" },
+        { key: "grand_total",   label: "ยอดรวมทั้งสิ้น",           type: "number" },
+        { key: "due_date",      label: "วันครบกำหนดชำระ",         type: "date" }
+      ]
+    },
+    {
+      id: "receipt", name: "ใบเสร็จรับเงิน", lineItems: true,
+      fields: [
+        { key: "doc_no",      label: "เลขที่ใบเสร็จ",   type: "text" },
+        { key: "doc_date",    label: "วันที่",          type: "date" },
+        { key: "vendor_name", label: "ชื่อร้าน",        type: "text" },
+        { key: "grand_total", label: "ยอดรวม",         type: "number" }
+      ]
+    },
+    {
+      id: "delivery_note", name: "ใบส่งของ", lineItems: true,
+      fields: [
+        { key: "doc_no",       label: "เลขที่ใบส่งของ", type: "text" },
+        { key: "doc_date",     label: "วันที่ส่ง",      type: "date" },
+        { key: "customer_name",label: "ชื่อผู้รับ",     type: "text" },
+        { key: "ref_po",       label: "อ้างอิง PO",    type: "text" }
+      ]
+    }
+  ],
+
+  /* ── PDF ──────────────────────────────────────────────────── */
+  pdf: { workerSrc: "https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs", scale: 2.0 }
+};
+
+/* ── ตัวแปลงผลลัพธ์จาก OCR API ของคุณ → รูปแบบที่แอปใช้ ─────────────
+   แก้ฟังก์ชันนี้ให้ตรงกับ response ของเซิร์ฟเวอร์คุณ
+   ต้อง return: { fields: { <key>: { value, confidence } }, items: [], raw_text }  */
+window.OCR_ADAPTER = function (json) {
+  if (json && json.fields) return json;                       // รูปแบบมาตรฐานของแอปนี้
+  var out = { fields: {}, items: json && json.items || [], raw_text: json && (json.raw_text || json.text) || "" };
+  var src = (json && (json.data || json.result)) || {};
+  Object.keys(src).forEach(function (k) {
+    var v = src[k];
+    out.fields[k] = (v && typeof v === "object")
+      ? { value: v.value != null ? v.value : "", confidence: v.confidence != null ? v.confidence : 1 }
+      : { value: v, confidence: 1 };
+  });
+  return out;
+};
+</script>
+
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:#07090F;font-family:Sarabun,system-ui,sans-serif;color:#F2F4F8;-webkit-font-smoothing:antialiased;overscroll-behavior:none}
+#app{max-width:520px;margin:0 auto;min-height:100dvh;background:#101828;display:flex;flex-direction:column;position:relative;overflow:hidden}
+a{color:#8AB4FF;text-decoration:none}a:hover{color:#B4CEFF}
+button{font-family:inherit;cursor:pointer}
+input,select{font-family:inherit}
+input:focus,select:focus{outline:2px solid rgba(138,180,255,.45);outline-offset:1px}
+::-webkit-scrollbar{width:0;height:0}
+.screen{flex:1;display:none;flex-direction:column;min-height:0}
+.screen.on{display:flex}
+.bar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 20px 12px;border-bottom:1px solid rgba(255,255,255,.08)}
+.bar h1{font-size:15px;font-weight:700;margin:0}
+.scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.foot{flex:none;padding:12px 20px calc(20px + env(safe-area-inset-bottom));border-top:1px solid rgba(255,255,255,.08);background:#18202F}
+.btn{width:100%;min-height:52px;border-radius:13px;border:none;background:#F2F4F8;color:#101828;font-size:16px;font-weight:700}
+.btn[disabled]{opacity:.4}
+.btn2{min-height:50px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#F2F4F8;font-size:14px;font-weight:600;padding:0 14px}
+.btn3{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#F2F4F8;font-size:13px;font-weight:500;padding:9px 13px;border-radius:999px;white-space:nowrap}
+.link{background:none;border:none;color:#8AB4FF;font-size:14px;font-weight:500;padding:8px 0}
+.chip{padding:9px 14px;border-radius:999px;font-size:13px;font-weight:500;white-space:nowrap;background:rgba(255,255,255,.06);color:rgba(242,244,248,.7);border:1px solid rgba(255,255,255,.14)}
+.chip.on{background:#F2F4F8;color:#101828;border-color:#F2F4F8}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:rgba(242,244,248,.42)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+label.fld{display:block;margin-bottom:14px}
+label.fld .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px;gap:8px}
+label.fld .lbl{font-size:12.5px;font-weight:600;color:rgba(242,244,248,.6)}
+label.fld input{width:100%;min-height:46px;padding:11px 13px;border-radius:11px;border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);font-size:15px;font-weight:500;color:#F2F4F8}
+label.fld.low input{border-color:rgba(240,186,84,.55);background:rgba(240,186,84,.08)}
+.meter{flex:1;height:3px;border-radius:99px;background:rgba(255,255,255,.1);overflow:hidden}
+.meter i{display:block;height:100%;background:#8AB4FF}
+.pill{font-size:11.5px;font-weight:600;padding:4px 9px;border-radius:999px;white-space:nowrap;background:rgba(138,180,255,.16);color:#8AB4FF}
+.pill.warn{background:rgba(240,186,84,.14);color:#F0BA54}
+.card{background:#18202F;border:1px solid rgba(255,255,255,.08);border-radius:12px}
+.thumb{border-radius:5px;flex:none;background:repeating-linear-gradient(180deg,rgba(255,255,255,.18) 0 2px,rgba(255,255,255,.05) 2px 5px);border:1px solid rgba(255,255,255,.1);object-fit:cover}
+.sheet{position:absolute;inset:0;background:rgba(7,9,15,.72);z-index:20;display:none;flex-direction:column;justify-content:flex-end}
+.sheet.on{display:flex}
+.sheet .panel{background:#18202F;border-radius:22px 22px 0 0;border-top:1px solid rgba(255,255,255,.1);padding:14px 20px calc(22px + env(safe-area-inset-bottom));animation:sheetUp .26s ease-out}
+.grab{width:44px;height:4px;border-radius:99px;background:rgba(255,255,255,.2);margin:0 auto 18px}
+.toast{position:absolute;left:16px;right:16px;bottom:calc(22px + env(safe-area-inset-bottom));z-index:40;background:#F2F4F8;color:#101828;border-radius:12px;padding:13px 15px;font-size:13.5px;font-weight:600;box-shadow:0 12px 30px -10px rgba(0,0,0,.7);display:none}
+.toast.on{display:block;animation:fadeUp .22s ease-out}
+.toast.err{background:#F0BA54}
+@keyframes sheetUp{from{transform:translateY(100%)}to{transform:none}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+@keyframes scanline{0%{top:8%}100%{top:88%}}
+@keyframes barfill{from{width:6%}to{width:92%}}
+#view{position:relative;width:100%;aspect-ratio:3/4;border-radius:8px;overflow:hidden;background:repeating-linear-gradient(180deg,rgba(255,255,255,.05) 0 3px,rgba(255,255,255,.015) 3px 10px)}
+#video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.corner{position:absolute;width:34px;height:34px;border:0 solid #8AB4FF}
+.scan{position:absolute;left:10px;right:10px;height:2px;background:#8AB4FF;box-shadow:0 0 16px 3px rgba(138,180,255,.55);animation:scanline 2.6s ease-in-out infinite alternate}
+.shutter{width:78px;height:78px;border-radius:50%;background:#F2F4F8;border:5px solid rgba(242,244,248,.28)}
+.step{display:flex;align-items:center;gap:12px;margin-bottom:14px;color:rgba(242,244,248,.4)}
+.step i{width:22px;height:22px;border-radius:50%;flex:none;border:2px solid rgba(255,255,255,.2)}
+.step.on{color:#F2F4F8}.step.on i{border-color:#8AB4FF}
+.step.done{color:#F2F4F8}.step.done i{border-color:#8AB4FF;background:#8AB4FF}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:rgba(242,244,248,.4);text-align:right;padding:0 6px 8px}
+th:first-child{text-align:left}
+td{background:#18202F;padding:12px 6px;border-top:1px solid rgba(255,255,255,.07);text-align:right}
+td:first-child{text-align:left;font-weight:500}
+.cfg label{display:block;margin-bottom:12px}
+.cfg span{display:block;font-size:12px;font-weight:600;color:rgba(242,244,248,.55);margin-bottom:5px}
+.cfg input,.cfg select{width:100%;min-height:44px;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:#F2F4F8;font-size:14px}
+.cfg h3{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:rgba(242,244,248,.42);margin:22px 0 10px}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ═══ กล้อง ═══ -->
+  <section class="screen on" id="s-capture">
+    <div class="bar" style="border:none">
+      <button class="btn3" id="to-docs">คลังเอกสาร</button>
+      <span style="font-size:12.5px;font-weight:600;color:rgba(242,244,248,.65);white-space:nowrap" id="cap-type">ใบกำกับภาษี</span>
+      <button class="btn3" id="to-settings">ตั้งค่า</button>
+    </div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:6px 20px 0;min-height:0">
+      <div id="view">
+        <video id="video" playsinline muted autoplay></video>
+        <span class="corner" style="top:10px;left:10px;border-top-width:3px;border-left-width:3px;border-radius:5px 0 0 0"></span>
+        <span class="corner" style="top:10px;right:10px;border-top-width:3px;border-right-width:3px;border-radius:0 5px 0 0"></span>
+        <span class="corner" style="bottom:10px;left:10px;border-bottom-width:3px;border-left-width:3px;border-radius:0 0 0 5px"></span>
+        <span class="corner" style="bottom:10px;right:10px;border-bottom-width:3px;border-right-width:3px;border-radius:0 0 5px 0"></span>
+        <span class="scan"></span>
+        <div id="cam-msg" class="mono" style="position:absolute;left:16px;right:16px;top:50%;transform:translateY(-50%);text-align:center;color:rgba(242,244,248,.4);font-size:12px;line-height:1.6">แตะ “เปิดกล้อง” เพื่อเริ่ม</div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:center;padding:14px 20px 0">
+      <span style="display:inline-flex;align-items:center;gap:8px;background:rgba(138,180,255,.14);border:1px solid rgba(138,180,255,.4);color:#8AB4FF;font-size:12.5px;font-weight:600;padding:8px 14px;border-radius:999px">
+        <span style="width:7px;height:7px;border-radius:50%;background:#8AB4FF;animation:pulse 1.4s infinite"></span><span id="cam-badge-t">พร้อมสแกน — จัดเอกสารให้อยู่ในกรอบ</span>
+      </span>
+    </div>
+    <div style="padding:16px 28px 10px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <button id="open-sheet" style="width:52px;height:52px;border-radius:12px;background:repeating-linear-gradient(180deg,rgba(255,255,255,.2) 0 2px,rgba(255,255,255,.05) 2px 6px);border:1.5px solid rgba(255,255,255,.3)"></button>
+      <button class="shutter" id="shoot"></button>
+      <button id="cam-toggle" style="width:52px;min-height:52px;border-radius:12px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#F2F4F8;font-size:11.5px;font-weight:600;padding:0 4px">เปิดกล้อง</button>
+    </div>
+    <button id="open-sheet2" style="border:none;background:none;padding:0 0 calc(20px + env(safe-area-inset-bottom));display:flex;flex-direction:column;align-items:center;gap:8px;color:rgba(242,244,248,.5)">
+      <span style="width:44px;height:4px;border-radius:99px;background:rgba(255,255,255,.22)"></span>
+      <span style="font-size:12.5px;font-weight:500">เลือกไฟล์ · ประเภทเอกสาร · งานล่าสุด</span>
+    </button>
+
+    <div class="sheet" id="sheet">
+      <div style="flex:1" id="sheet-bg"></div>
+      <div class="panel">
+        <div class="grab"></div>
+        <div class="eyebrow" style="margin-bottom:9px">ประเภทเอกสาร</div>
+        <div id="type-chips" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+        <div style="display:flex;gap:10px;margin-top:18px">
+          <button class="btn2" style="flex:1" id="pick-image">เลือกไฟล์ภาพ</button>
+          <button class="btn2" style="flex:1" id="pick-pdf">อัปโหลด PDF</button>
+        </div>
+        <div class="eyebrow" style="margin:22px 0 9px">งานล่าสุด</div>
+        <div id="recent-list" style="display:flex;flex-direction:column;gap:8px"></div>
+        <button class="link" style="width:100%;color:rgba(242,244,248,.5);min-height:46px;margin-top:12px" id="close-sheet">ปิด</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ ประมวลผล ═══ -->
+  <section class="screen" id="s-processing">
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:0 28px 50px">
+      <div style="width:104px;height:134px;border-radius:8px;margin:0 auto 30px;position:relative;overflow:hidden;border:1px solid rgba(255,255,255,.12);background:repeating-linear-gradient(180deg,rgba(255,255,255,.16) 0 3px,rgba(255,255,255,.04) 3px 8px)">
+        <img id="proc-img" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none" alt="">
+        <span class="scan" style="animation-duration:1.4s;left:0;right:0"></span>
+      </div>
+      <div style="text-align:center;font-size:19px;font-weight:700">กำลังอ่านเอกสาร</div>
+      <div style="text-align:center;font-size:13px;color:rgba(242,244,248,.5);margin-top:4px" id="proc-sub">ใบกำกับภาษี · 1 หน้า</div>
+      <div style="height:6px;border-radius:99px;background:rgba(255,255,255,.1);margin:26px 0 22px;overflow:hidden"><div id="proc-bar" style="height:100%;background:#8AB4FF;border-radius:99px;width:6%;animation:barfill 6s ease-out forwards"></div></div>
+      <div id="proc-steps"></div>
+      <button class="link" style="align-self:center;margin-top:8px;color:rgba(242,244,248,.5)" id="proc-cancel">ยกเลิก</button>
+    </div>
+  </section>
+
+  <!-- ═══ ตรวจแก้ ═══ -->
+  <section class="screen" id="s-review">
+    <div class="bar">
+      <button class="link" style="color:rgba(242,244,248,.6)" id="rev-cancel">ยกเลิก</button>
+      <h1>ตรวจแก้ข้อมูล</h1>
+      <button class="link" id="rev-raw">ข้อความดิบ</button>
+    </div>
+    <div class="scroll" style="padding:14px 20px 0">
+      <div style="display:flex;gap:12px;align-items:center">
+        <img id="rev-thumb" class="thumb" style="width:52px;height:68px" alt="">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13.5px;font-weight:600" id="rev-name">—</div>
+          <div style="font-size:12px;color:rgba(242,244,248,.45);margin-top:2px" id="rev-meta">—</div>
+          <div class="meter" style="margin-top:7px;height:5px"><i id="rev-avg" style="width:0"></i></div>
+        </div>
+      </div>
+      <div id="rev-warn" style="display:none;margin-top:16px;padding:12px 14px;border-radius:11px;background:rgba(240,186,84,.1);border:1px solid rgba(240,186,84,.35);font-size:13px;line-height:1.5;color:#F5D49A"></div>
+      <div id="rev-fields" style="margin-top:18px"></div>
+      <button class="btn2" style="width:100%;display:flex;align-items:center;justify-content:space-between;margin:8px 0 22px" id="to-items">
+        <span style="font-size:14.5px;font-weight:600">รายการสินค้า</span>
+        <span style="font-size:13px;color:rgba(242,244,248,.5)" id="items-count">0 บรรทัด ›</span>
+      </button>
+    </div>
+    <div class="foot"><button class="btn" id="save-db">บันทึกเข้าฐานข้อมูล</button></div>
+  </section>
+
+  <!-- ═══ รายการสินค้า ═══ -->
+  <section class="screen" id="s-items">
+    <div class="bar" style="justify-content:flex-start;gap:12px">
+      <button class="link" id="items-back">‹ กลับ</button><h1>รายการสินค้า</h1>
+    </div>
+    <div class="scroll" style="padding:16px 20px 0">
+      <table><thead><tr><th>รายละเอียด</th><th style="width:52px">จำนวน</th><th style="width:88px">รวม</th></tr></thead><tbody id="items-body"></tbody></table>
+      <div class="card" style="margin-top:14px;padding:14px" id="items-totals"></div>
+      <div style="height:22px"></div>
+    </div>
+    <div class="foot" style="background:none"><button class="btn2" style="width:100%" id="items-ok">ยืนยันรายการ</button></div>
+  </section>
+
+  <!-- ═══ บันทึกแล้ว ═══ -->
+  <section class="screen" id="s-saved">
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:0 24px 36px;animation:fadeUp .35s ease-out">
+      <div style="width:64px;height:64px;border-radius:50%;background:#8AB4FF;margin:0 auto 22px;display:flex;align-items:center;justify-content:center">
+        <span style="width:20px;height:11px;border-left:3.5px solid #101828;border-bottom:3.5px solid #101828;transform:rotate(-45deg) translate(1px,-3px)"></span>
+      </div>
+      <div style="text-align:center;font-size:21px;font-weight:700" id="saved-title">บันทึกเข้าฐานข้อมูลแล้ว</div>
+      <div style="text-align:center;font-size:13.5px;color:rgba(242,244,248,.55);margin-top:5px" id="saved-sub"></div>
+      <pre class="mono" id="saved-json" style="margin:22px 0 0;background:#0A0F1A;border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:14px;font-size:11px;line-height:1.7;color:#C7CEDB;overflow:auto;max-height:230px;white-space:pre-wrap"></pre>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button class="btn2" style="flex:1" id="dl-csv">ส่งออก CSV</button>
+        <button class="btn2" style="flex:1" id="dl-json">ดาวน์โหลด JSON</button>
+      </div>
+      <button class="btn" style="margin-top:10px" id="scan-next">สแกนเอกสารถัดไป</button>
+      <button class="link" style="width:100%;color:rgba(242,244,248,.5);min-height:44px" id="saved-docs">ไปที่คลังเอกสาร</button>
+    </div>
+  </section>
+
+  <!-- ═══ คลังเอกสาร ═══ -->
+  <section class="screen" id="s-docs">
+    <div class="bar" style="justify-content:flex-start;gap:12px">
+      <button class="link" id="docs-back">‹ กล้อง</button><h1>คลังเอกสาร</h1>
+    </div>
+    <div class="scroll" style="padding:16px 20px 0">
+      <div id="docs-filters" style="display:flex;gap:8px;margin-bottom:14px"></div>
+      <div id="docs-list" style="display:flex;flex-direction:column;gap:8px"></div>
+      <div style="height:22px"></div>
+    </div>
+    <div class="foot" style="background:none"><button class="btn" id="docs-scan">สแกนเอกสารใหม่</button></div>
+  </section>
+
+  <!-- ═══ ตั้งค่า ═══ -->
+  <section class="screen" id="s-settings">
+    <div class="bar" style="justify-content:flex-start;gap:12px">
+      <button class="link" id="cfg-back">‹ กล้อง</button><h1>ตั้งค่าเซิร์ฟเวอร์</h1>
+    </div>
+    <div class="scroll cfg" style="padding:18px 20px 0">
+      <label><span>โหมดทำงาน</span><select id="c-mode"><option value="demo">demo — ข้อมูลตัวอย่าง ไม่เรียกเซิร์ฟเวอร์</option><option value="live">live — เรียก API จริง</option></select></label>
+      <h3>OCR Server</h3>
+      <label><span>Endpoint</span><input id="c-ocr-ep" placeholder="https://…/api/ocr"></label>
+      <label><span>รูปแบบ payload</span><select id="c-ocr-payload"><option value="json">json (base64)</option><option value="multipart">multipart/form-data</option></select></label>
+      <label><span>API key / token</span><input id="c-ocr-key" placeholder="ว่างไว้ถ้าไม่ใช้"></label>
+      <label><span>ภาษา OCR</span><input id="c-ocr-lang" placeholder="tha+eng"></label>
+      <h3>Database Server</h3>
+      <label><span>Endpoint (insert)</span><input id="c-db-ep" placeholder="https://…/api/documents"></label>
+      <label><span>API key / token</span><input id="c-db-key"></label>
+      <label><span>ตารางหลัก</span><input id="c-db-table" placeholder="documents"></label>
+      <label><span>ตารางรายการ</span><input id="c-db-items" placeholder="document_items"></label>
+      <h3>การตรวจสอบ</h3>
+      <label><span>เกณฑ์ความมั่นใจต่ำ (0–1)</span><input id="c-low" type="number" step="0.01" min="0" max="1"></label>
+      <label style="display:flex;align-items:center;gap:10px;margin-top:14px"><input id="c-block" type="checkbox" style="width:22px;height:22px;min-height:0;flex:none"><span style="margin:0">ห้ามบันทึกจนกว่าจะยืนยันฟิลด์ที่มั่นใจต่ำ</span></label>
+      <p style="font-size:12px;line-height:1.65;color:rgba(242,244,248,.45);margin:18px 0 0">ค่าเริ่มต้นทั้งหมดอยู่ในบล็อก <span class="mono">window.APP_CONFIG</span> ที่หัวไฟล์ HTML นี้ ค่าที่แก้ในหน้านี้จะเก็บไว้ในเครื่อง (localStorage) และมีผลเหนือค่าในไฟล์</p>
+      <button class="link" style="color:#F0BA54;margin:10px 0 20px" id="cfg-reset">คืนค่าเริ่มต้นจากไฟล์</button>
+    </div>
+    <div class="foot"><button class="btn" id="cfg-save">บันทึกการตั้งค่า</button></div>
+  </section>
+
+  <div class="toast" id="toast"></div>
+  <input type="file" id="file-image" accept="image/*" style="display:none">
+  <input type="file" id="file-pdf" accept="application/pdf" style="display:none">
+  <canvas id="work" style="display:none"></canvas>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var CFG_KEY = "ocr.config.v1", DOCS_KEY = "ocr.docs.v1";
+  var DEFAULTS = window.APP_CONFIG, CFG = load();
+  var $ = function (id) { return document.getElementById(id); };
+
+  function deepMerge(a, b) {
+    var out = JSON.parse(JSON.stringify(a));
+    Object.keys(b || {}).forEach(function (k) {
+      out[k] = (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) ? deepMerge(out[k] || {}, b[k]) : b[k];
+    });
+    return out;
+  }
+  function load() {
+    try { var s = localStorage.getItem(CFG_KEY); return s ? deepMerge(DEFAULTS, JSON.parse(s)) : deepMerge(DEFAULTS, {}); }
+    catch (e) { return deepMerge(DEFAULTS, {}); }
+  }
+  function saveCfg() { try { localStorage.setItem(CFG_KEY, JSON.stringify(CFG)); } catch (e) {} }
+
+  var S = {
+    screen: "capture", tpl: CFG.templates[0], filter: "ทั้งหมด",
+    imageDataUrl: null, sourceName: "", pages: 1,
+    fields: {}, items: [], rawText: "", stream: null, aborted: false
+  };
+
+  function show(name) {
+    S.screen = name;
+    ["capture", "processing", "review", "items", "saved", "docs", "settings"].forEach(function (n) {
+      $("s-" + n).classList.toggle("on", n === name);
+    });
+    if (name !== "capture") stopCam();
+  }
+  var toastT;
+  function toast(msg, isErr) {
+    var t = $("toast"); t.textContent = msg; t.className = "toast on" + (isErr ? " err" : "");
+    clearTimeout(toastT); toastT = setTimeout(function () { t.className = "toast"; }, 3600);
+  }
+
+  /* ── กล้อง ─────────────────────────────────────────────── */
+  function startCam() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      $("cam-msg").textContent = "เบราว์เซอร์นี้ไม่รองรับกล้อง — ใช้ “เลือกไฟล์ภาพ” แทน"; return;
+    }
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: CFG.camera.facingMode }, width: { ideal: CFG.camera.idealWidth }, height: { ideal: CFG.camera.idealHeight } },
+      audio: false
+    }).then(function (st) {
+      S.stream = st; $("video").srcObject = st; $("cam-msg").style.display = "none";
+      $("cam-toggle").textContent = "ปิดกล้อง"; $("cam-badge-t").textContent = "กล้องพร้อม — จัดเอกสารให้อยู่ในกรอบ";
+    }).catch(function (err) {
+      $("cam-msg").style.display = "";
+      $("cam-msg").textContent = "เปิดกล้องไม่ได้ (" + (err && err.name || "error") + ") — หน้านี้ต้องเปิดผ่าน https หรือ localhost";
+    });
+  }
+  function stopCam() {
+    if (S.stream) { S.stream.getTracks().forEach(function (t) { t.stop(); }); S.stream = null; }
+    $("cam-toggle").textContent = "เปิดกล้อง"; $("cam-msg").style.display = "";
+    $("cam-msg").textContent = "แตะ “เปิดกล้อง” เพื่อเริ่ม";
+  }
+
+  function fitCanvas(w, h) {
+    var max = CFG.review.imageMaxWidth, sc = Math.min(1, max / Math.max(w, h));
+    var c = $("work"); c.width = Math.round(w * sc); c.height = Math.round(h * sc); return c;
+  }
+  function grabFrame() {
+    var v = $("video");
+    if (!v.videoWidth) { toast("ยังไม่มีภาพจากกล้อง — กด “เปิดกล้อง” ก่อน", true); return null; }
+    var c = fitCanvas(v.videoWidth, v.videoHeight);
+    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", CFG.review.jpegQuality);
+  }
+
+  /* ── ไฟล์ภาพ / PDF ─────────────────────────────────────── */
+  function readImageFile(file) {
+    return new Promise(function (res, rej) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var c = fitCanvas(img.width, img.height);
+          c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+          res(c.toDataURL("image/jpeg", CFG.review.jpegQuality));
+        };
+        img.onerror = rej; img.src = fr.result;
+      };
+      fr.onerror = rej; fr.readAsDataURL(file);
+    });
+  }
+  function readPdfFirstPage(file) {
+    return new Promise(function (res, rej) {
+      import("https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.min.mjs").then(function (pdfjs) {
+        pdfjs.GlobalWorkerOptions.workerSrc = CFG.pdf.workerSrc;
+        return file.arrayBuffer().then(function (buf) { return pdfjs.getDocument({ data: buf }).promise; });
+      }).then(function (doc) {
+        S.pages = doc.numPages;
+        return doc.getPage(1).then(function (page) {
+          var vp = page.getViewport({ scale: CFG.pdf.scale });
+          var c = $("work"); c.width = vp.width; c.height = vp.height;
+          return page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise.then(function () {
+            res(c.toDataURL("image/jpeg", CFG.review.jpegQuality));
+          });
+        });
+      }).catch(rej);
+    });
+  }
+
+  /* ── OCR ──────────────────────────────────────────────── */
+  var STEP_LABELS = ["ปรับภาพและเพิ่มความคมชัด", "อ่านตัวอักษร (OCR)", "แยกฟิลด์ข้อมูลตามประเภทเอกสาร"];
+  function renderSteps(active) {
+    $("proc-steps").innerHTML = STEP_LABELS.map(function (l, i) {
+      var cls = i < active ? "step done" : i === active ? "step on" : "step";
+      return '<div class="' + cls + '"><i></i><span style="font-size:14.5px;font-weight:500">' + l + "</span></div>";
+    }).join("");
+  }
+
+  function startOCR(dataUrl, name) {
+    S.imageDataUrl = dataUrl; S.sourceName = name; S.aborted = false;
+    $("proc-img").src = dataUrl; $("proc-img").style.display = "";
+    $("proc-sub").textContent = S.tpl.name + " · " + S.pages + " หน้า";
+    var bar = $("proc-bar"); bar.style.animation = "none"; void bar.offsetWidth; bar.style.animation = "barfill 6s ease-out forwards";
+    renderSteps(0); show("processing");
+    setTimeout(function () { if (!S.aborted) renderSteps(1); }, 500);
+
+    if (CFG.mode !== "live" || !CFG.ocr.endpoint || /your-server\.example\.com/.test(CFG.ocr.endpoint)) {
+      setTimeout(function () {
+        if (S.aborted) return;
+        renderSteps(2);
+        setTimeout(function () { if (!S.aborted) applyResult(demoResult()); }, 700);
+      }, 900);
+      return;
+    }
+
+    callOCR(dataUrl).then(function (json) {
+      if (S.aborted) return;
+      renderSteps(2);
+      applyResult(window.OCR_ADAPTER(json));
+    }).catch(function (err) {
+      if (S.aborted) return;
+      toast("เรียก OCR ไม่สำเร็จ: " + (err && err.message || err), true);
+      show("capture");
+    });
+  }
+
+  function callOCR(dataUrl) {
+    var o = CFG.ocr, headers = {}, body;
+    if (o.apiKey) headers[o.headerName || "Authorization"] = (o.headerPrefix || "") + o.apiKey;
+    if (o.payload === "multipart") {
+      body = new FormData();
+      body.append("file", dataUrlToBlob(dataUrl), (S.sourceName || "scan") + ".jpg");
+      body.append("doc_type", S.tpl.id); body.append("lang", o.lang || "tha+eng");
+    } else {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify({ image: dataUrl.split(",")[1], doc_type: S.tpl.id, lang: o.lang || "tha+eng",
+        fields: S.tpl.fields.map(function (f) { return f.key; }) });
+    }
+    var ctrl = new AbortController(), to = setTimeout(function () { ctrl.abort(); }, o.timeoutMs || 60000);
+    return fetch(o.endpoint, { method: o.method || "POST", headers: headers, body: body, signal: ctrl.signal })
+      .then(function (r) { clearTimeout(to); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+  }
+  function dataUrlToBlob(u) {
+    var parts = u.split(","), bin = atob(parts[1]), arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: "image/jpeg" });
+  }
+
+  function demoResult() {
+    return {
+      fields: {
+        doc_no: { value: "IV-2569/0842", confidence: 0.99 },
+        doc_date: { value: "2026-08-12", confidence: 0.98 },
+        vendor_name: { value: "บริษัท ไทยเทค ซัพพลาย จำกัด", confidence: 0.96 },
+        vendor_tax_id: { value: "0105548123456", confidence: 0.83 },
+        subtotal: { value: "12400.00", confidence: 0.99 },
+        vat_amount: { value: "868.00", confidence: 0.99 },
+        grand_total: { value: "13268.00", confidence: 0.97 },
+        due_date: { value: "2026-09-11", confidence: 0.72 },
+        customer_name: { value: "บริษัท ตัวอย่าง จำกัด", confidence: 0.94 },
+        ref_po: { value: "PO-2569-0231", confidence: 0.9 }
+      },
+      items: [
+        { name: "สายสัญญาณ HDMI 2.1 · 3 ม.", qty: 12, unit_price: 390, amount: 4680 },
+        { name: "อะแดปเตอร์ USB-C 65W", qty: 6, unit_price: 890, amount: 5340 },
+        { name: "ขาตั้งจอปรับระดับ", qty: 2, unit_price: 990, amount: 1980 },
+        { name: "ค่าจัดส่ง", qty: 1, unit_price: 400, amount: 400 }
+      ],
+      raw_text: "(โหมด demo — ยังไม่ได้เชื่อมต่อ OCR Server จริง)"
+    };
+  }
+
+  function applyResult(res) {
+    S.fields = {}; S.rawText = res.raw_text || "";
+    S.tpl.fields.forEach(function (f) {
+      var got = (res.fields || {})[f.key] || {};
+      S.fields[f.key] = { value: got.value != null ? String(got.value) : "", confidence: got.confidence != null ? got.confidence : 0 };
+    });
+    S.items = S.tpl.lineItems ? (res.items || []) : [];
+    renderReview(); show("review");
+  }
+
+  /* ── หน้าตรวจแก้ ───────────────────────────────────────── */
+  function renderReview() {
+    var lowT = Number(CFG.review.lowConfidence) || 0.85;
+    var list = S.tpl.fields.slice().sort(function (a, b) {
+      var la = S.fields[a.key].confidence < lowT ? 0 : 1, lb = S.fields[b.key].confidence < lowT ? 0 : 1;
+      return la - lb;
+    });
+    var confs = S.tpl.fields.map(function (f) { return S.fields[f.key].confidence; });
+    var avg = confs.length ? confs.reduce(function (a, b) { return a + b; }, 0) / confs.length : 0;
+    var lows = confs.filter(function (c) { return c < lowT; }).length;
+
+    $("rev-thumb").src = S.imageDataUrl || "";
+    $("rev-name").textContent = S.sourceName || "scan.jpg";
+    $("rev-meta").textContent = "อ่านได้ " + S.tpl.fields.length + " ฟิลด์ · ความมั่นใจเฉลี่ย " + Math.round(avg * 100) + "%";
+    $("rev-avg").style.width = Math.round(avg * 100) + "%";
+    var w = $("rev-warn");
+    if (lows) { w.style.display = ""; w.innerHTML = "<b>" + lows + " ฟิลด์ต้องตรวจสอบ</b> — ความมั่นใจต่ำกว่า " + Math.round(lowT * 100) + "% กรุณาเทียบกับต้นฉบับก่อนบันทึก"; }
+    else w.style.display = "none";
+
+    $("rev-fields").innerHTML = list.map(function (f) {
+      var d = S.fields[f.key], pct = Math.round(d.confidence * 100), low = d.confidence < lowT;
+      return '<label class="fld' + (low ? " low" : "") + '">' +
+        '<span class="top"><span class="lbl">' + f.label + '</span>' +
+        '<span class="mono" style="font-size:11px;font-weight:600;color:' + (low ? "#F0BA54" : "#8AB4FF") + '">' + pct + '%</span></span>' +
+        '<input type="text" data-key="' + f.key + '" value="' + esc(d.value) + '">' +
+        '<span style="display:flex;align-items:center;gap:8px;margin-top:6px">' +
+        '<span class="meter"><i style="width:' + pct + '%;background:' + (low ? "#F0BA54" : "#8AB4FF") + '"></i></span>' +
+        '<span class="mono" style="font-size:10.5px;color:rgba(242,244,248,.35)">' + f.key + '</span></span></label>';
+    }).join("");
+    Array.prototype.forEach.call($("rev-fields").querySelectorAll("input"), function (inp) {
+      inp.addEventListener("input", function () { S.fields[inp.dataset.key].value = inp.value; });
+    });
+
+    $("to-items").style.display = S.tpl.lineItems ? "flex" : "none";
+    $("items-count").textContent = S.items.length + " บรรทัด ›";
+  }
+  function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;"); }
+  function num(v) { var n = parseFloat(String(v).replace(/[^\d.-]/g, "")); return isNaN(n) ? 0 : n; }
+  function money(n) { return num(n).toLocaleString("th-TH", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+
+  function renderItems() {
+    $("items-body").innerHTML = S.items.length
+      ? S.items.map(function (it) {
+          return "<tr><td>" + esc(it.name) + '</td><td class="mono">' + esc(it.qty) + '</td><td class="mono" style="font-weight:600">' + money(it.amount) + "</td></tr>";
+        }).join("")
+      : '<tr><td colspan="3" style="color:rgba(242,244,248,.45);text-align:center">ไม่พบรายการในเอกสารนี้</td></tr>';
+    var sum = S.items.reduce(function (a, it) { return a + num(it.amount); }, 0);
+    var rows = [["รวมรายการ", money(sum)]];
+    if (S.fields.subtotal) rows.push(["ยอดก่อนภาษี", money(S.fields.subtotal.value)]);
+    if (S.fields.vat_amount) rows.push(["ภาษีมูลค่าเพิ่ม", money(S.fields.vat_amount.value)]);
+    if (S.fields.grand_total) rows.push(["ยอดรวมทั้งสิ้น", money(S.fields.grand_total.value)]);
+    $("items-totals").innerHTML = rows.map(function (r, i) {
+      var last = i === rows.length - 1;
+      return '<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:' + (last ? "16px" : "13.5px") + ";font-weight:" + (last ? "700" : "500") + '"><span style="color:' + (last ? "#F2F4F8" : "rgba(242,244,248,.6)") + '">' + r[0] + '</span><span class="mono">' + r[1] + "</span></div>";
+    }).join("");
+  }
+
+  /* ── บันทึกเข้าฐานข้อมูล ────────────────────────────────── */
+  function buildPayload() {
+    var p = { table: CFG.db.table, items_table: CFG.db.itemsTable, doc_type: S.tpl.id, source_file: S.sourceName, pages: S.pages, data: {}, confidence: {}, items: S.items, raw_text: S.rawText, scanned_at: new Date().toISOString() };
+    S.tpl.fields.forEach(function (f) {
+      var v = S.fields[f.key].value;
+      p.data[f.key] = f.type === "number" ? num(v) : v;
+      p.confidence[f.key] = S.fields[f.key].confidence;
+    });
+    return p;
+  }
+  function saveToDB() {
+    var lowT = Number(CFG.review.lowConfidence) || 0.85;
+    var lows = S.tpl.fields.filter(function (f) { return S.fields[f.key].confidence < lowT; });
+    if (CFG.review.blockSaveOnLow && lows.length) { toast("ยืนยันฟิลด์ที่มั่นใจต่ำก่อนบันทึก (" + lows.length + " ฟิลด์)", true); return; }
+
+    var payload = buildPayload(), btn = $("save-db");
+    btn.disabled = true; btn.textContent = "กำลังบันทึก…";
+
+    var done = function (recordId, note) {
+      btn.disabled = false; btn.textContent = "บันทึกเข้าฐานข้อมูล";
+      payload.record_id = recordId;
+      archive(payload, lows.length ? "รอตรวจ" : "บันทึกแล้ว");
+      $("saved-sub").textContent = S.tpl.fields.length + " ฟิลด์ และ " + S.items.length + " บรรทัดรายการ" + (note ? " · " + note : "");
+      $("saved-json").textContent = JSON.stringify(payload, null, 2);
+      S.lastPayload = payload; show("saved");
+    };
+
+    if (CFG.mode !== "live" || !CFG.db.endpoint || /your-server\.example\.com/.test(CFG.db.endpoint)) {
+      setTimeout(function () { done("demo-" + Date.now().toString().slice(-6), "โหมด demo (ไม่ได้ส่งเซิร์ฟเวอร์)"); }, 500);
+      return;
+    }
+    var headers = { "Content-Type": "application/json" };
+    if (CFG.db.apiKey) headers[CFG.db.headerName || "Authorization"] = (CFG.db.headerPrefix || "") + CFG.db.apiKey;
+    fetch(CFG.db.endpoint, { method: CFG.db.method || "POST", headers: headers, body: JSON.stringify(payload) })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json().catch(function () { return {}; }); })
+      .then(function (j) { done(j.id || j.record_id || "—"); })
+      .catch(function (err) {
+        btn.disabled = false; btn.textContent = "บันทึกเข้าฐานข้อมูล";
+        toast("บันทึกไม่สำเร็จ: " + (err && err.message || err), true);
+      });
+  }
+
+  /* ── คลังเอกสาร (เก็บในเครื่อง) ──────────────────────────── */
+  function docs() { try { return JSON.parse(localStorage.getItem(DOCS_KEY) || "[]"); } catch (e) { return []; } }
+  function archive(payload, status) {
+    var l = docs();
+    l.unshift({ id: payload.record_id, title: (payload.data.doc_no || S.sourceName || "เอกสาร") + " · " + (payload.data.vendor_name || payload.data.customer_name || S.tpl.name),
+      meta: new Date().toLocaleString("th-TH", { dateStyle: "medium", timeStyle: "short" }) + " · " + Object.keys(payload.data).length + " ฟิลด์",
+      status: status, thumb: S.imageDataUrl, payload: payload });
+    try { localStorage.setItem(DOCS_KEY, JSON.stringify(l.slice(0, 40))); } catch (e) {}
+  }
+  function renderDocs() {
+    $("docs-filters").innerHTML = ["ทั้งหมด", "รอตรวจ", "บันทึกแล้ว"].map(function (f) {
+      return '<button class="chip' + (f === S.filter ? " on" : "") + '" data-f="' + f + '">' + f + "</button>";
+    }).join("");
+    Array.prototype.forEach.call($("docs-filters").children, function (b) {
+      b.onclick = function () { S.filter = b.dataset.f; renderDocs(); };
+    });
+    var list = docs().filter(function (d) { return S.filter === "ทั้งหมด" || d.status === S.filter; });
+    $("docs-list").innerHTML = list.length ? list.map(function (d, i) {
+      return '<div class="card" data-i="' + i + '" style="display:flex;gap:12px;align-items:center;padding:11px 13px">' +
+        (d.thumb ? '<img class="thumb" style="width:40px;height:52px" src="' + d.thumb + '">' : '<div class="thumb" style="width:40px;height:52px"></div>') +
+        '<div style="flex:1;min-width:0"><div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(d.title) + "</div>" +
+        '<div style="font-size:12px;color:rgba(242,244,248,.45);margin-top:2px">' + esc(d.meta) + "</div></div>" +
+        '<span class="pill' + (d.status === "รอตรวจ" ? " warn" : "") + '">' + d.status + "</span></div>";
+    }).join("") : '<div style="padding:30px 0;text-align:center;color:rgba(242,244,248,.4);font-size:13.5px">ยังไม่มีเอกสารที่บันทึก</div>';
+    Array.prototype.forEach.call($("docs-list").querySelectorAll(".card"), function (el) {
+      el.onclick = function () {
+        var d = list[+el.dataset.i]; if (!d) return;
+        $("saved-json").textContent = JSON.stringify(d.payload, null, 2);
+        $("saved-sub").textContent = d.meta; S.lastPayload = d.payload;
+        S.imageDataUrl = d.thumb; show("saved");
+      };
+    });
+  }
+
+  /* ── ส่งออกไฟล์ ────────────────────────────────────────── */
+  function download(name, text, type) {
+    var b = new Blob([text], { type: type }), u = URL.createObjectURL(b), a = document.createElement("a");
+    a.href = u; a.download = name; a.click(); setTimeout(function () { URL.revokeObjectURL(u); }, 1500);
+  }
+  function toCSV(p) {
+    var keys = Object.keys(p.data), head = keys.join(","), row = keys.map(function (k) { return '"' + String(p.data[k]).replace(/"/g, '""') + '"'; }).join(",");
+    var out = head + "\n" + row;
+    if (p.items && p.items.length) {
+      out += "\n\nname,qty,unit_price,amount\n" + p.items.map(function (i) {
+        return '"' + String(i.name).replace(/"/g, '""') + '",' + (i.qty || "") + "," + (i.unit_price || "") + "," + (i.amount || "");
+      }).join("\n");
+    }
+    return "\uFEFF" + out;
+  }
+
+  /* ── ตั้งค่า ───────────────────────────────────────────── */
+  function fillCfgForm() {
+    $("c-mode").value = CFG.mode; $("c-ocr-ep").value = CFG.ocr.endpoint || "";
+    $("c-ocr-payload").value = CFG.ocr.payload || "json"; $("c-ocr-key").value = CFG.ocr.apiKey || "";
+    $("c-ocr-lang").value = CFG.ocr.lang || ""; $("c-db-ep").value = CFG.db.endpoint || "";
+    $("c-db-key").value = CFG.db.apiKey || ""; $("c-db-table").value = CFG.db.table || "";
+    $("c-db-items").value = CFG.db.itemsTable || ""; $("c-low").value = CFG.review.lowConfidence;
+    $("c-block").checked = !!CFG.review.blockSaveOnLow;
+  }
+  function readCfgForm() {
+    CFG.mode = $("c-mode").value;
+    CFG.ocr.endpoint = $("c-ocr-ep").value.trim(); CFG.ocr.payload = $("c-ocr-payload").value;
+    CFG.ocr.apiKey = $("c-ocr-key").value.trim(); CFG.ocr.lang = $("c-ocr-lang").value.trim();
+    CFG.db.endpoint = $("c-db-ep").value.trim(); CFG.db.apiKey = $("c-db-key").value.trim();
+    CFG.db.table = $("c-db-table").value.trim(); CFG.db.itemsTable = $("c-db-items").value.trim();
+    CFG.review.lowConfidence = Math.min(1, Math.max(0, parseFloat($("c-low").value) || 0.85));
+    CFG.review.blockSaveOnLow = $("c-block").checked;
+    saveCfg();
+  }
+
+  /* ── เชื่อมปุ่ม ─────────────────────────────────────────── */
+  function renderTypeChips() {
+    $("type-chips").innerHTML = CFG.templates.map(function (t) {
+      return '<button class="chip' + (t.id === S.tpl.id ? " on" : "") + '" data-id="' + t.id + '">' + t.name + "</button>";
+    }).join("");
+    Array.prototype.forEach.call($("type-chips").children, function (b) {
+      b.onclick = function () {
+        S.tpl = CFG.templates.filter(function (t) { return t.id === b.dataset.id; })[0];
+        $("cap-type").textContent = S.tpl.name; renderTypeChips();
+      };
+    });
+  }
+  function renderRecent() {
+    var l = docs().slice(0, 3);
+    $("recent-list").innerHTML = l.length ? l.map(function (d) {
+      return '<div class="card" style="display:flex;gap:12px;align-items:center;padding:10px 12px;background:rgba(255,255,255,.05)">' +
+        (d.thumb ? '<img class="thumb" style="width:36px;height:46px" src="' + d.thumb + '">' : '<div class="thumb" style="width:36px;height:46px"></div>') +
+        '<div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(d.title) + "</div>" +
+        '<div style="font-size:12px;color:rgba(242,244,248,.45);margin-top:2px">' + esc(d.meta) + "</div></div>" +
+        '<span class="pill' + (d.status === "รอตรวจ" ? " warn" : "") + '">' + d.status + "</span></div>";
+    }).join("") : '<div style="font-size:13px;color:rgba(242,244,248,.4);padding:6px 0">ยังไม่มีงานที่บันทึก</div>';
+  }
+  function openSheet() { renderTypeChips(); renderRecent(); $("sheet").classList.add("on"); }
+  function closeSheet() { $("sheet").classList.remove("on"); }
+
+  $("cam-toggle").onclick = function () { S.stream ? stopCam() : startCam(); };
+  $("shoot").onclick = function () { var d = grabFrame(); if (d) { S.pages = 1; startOCR(d, "camera-" + Date.now() + ".jpg"); } };
+  $("open-sheet").onclick = openSheet; $("open-sheet2").onclick = openSheet;
+  $("close-sheet").onclick = closeSheet; $("sheet-bg").onclick = closeSheet;
+  $("pick-image").onclick = function () { $("file-image").click(); };
+  $("pick-pdf").onclick = function () { $("file-pdf").click(); };
+  $("file-image").onchange = function (e) {
+    var f = e.target.files[0]; if (!f) return; closeSheet();
+    readImageFile(f).then(function (d) { S.pages = 1; startOCR(d, f.name); })
+      .catch(function () { toast("อ่านไฟล์ภาพไม่สำเร็จ", true); });
+    e.target.value = "";
+  };
+  $("file-pdf").onchange = function (e) {
+    var f = e.target.files[0]; if (!f) return; closeSheet();
+    toast("กำลังแปลง PDF…");
+    readPdfFirstPage(f).then(function (d) { startOCR(d, f.name); })
+      .catch(function (err) { toast("อ่าน PDF ไม่สำเร็จ: " + (err && err.message || err), true); });
+    e.target.value = "";
+  };
+  $("proc-cancel").onclick = function () { S.aborted = true; show("capture"); };
+  $("rev-cancel").onclick = function () { show("capture"); };
+  $("rev-raw").onclick = function () { alert(S.rawText || "ไม่มีข้อความดิบจากเซิร์ฟเวอร์"); };
+  $("to-items").onclick = function () { renderItems(); show("items"); };
+  $("items-back").onclick = function () { show("review"); };
+  $("items-ok").onclick = function () { show("review"); };
+  $("save-db").onclick = saveToDB;
+  $("scan-next").onclick = function () { show("capture"); };
+  $("saved-docs").onclick = function () { renderDocs(); show("docs"); };
+  $("dl-json").onclick = function () { if (S.lastPayload) download("ocr-" + (S.lastPayload.data.doc_no || "doc") + ".json", JSON.stringify(S.lastPayload, null, 2), "application/json"); };
+  $("dl-csv").onclick = function () { if (S.lastPayload) download("ocr-" + (S.lastPayload.data.doc_no || "doc") + ".csv", toCSV(S.lastPayload), "text/csv"); };
+  $("to-docs").onclick = function () { renderDocs(); show("docs"); };
+  $("docs-back").onclick = function () { show("capture"); };
+  $("docs-scan").onclick = function () { show("capture"); };
+  $("to-settings").onclick = function () { fillCfgForm(); show("settings"); };
+  $("cfg-back").onclick = function () { show("capture"); };
+  $("cfg-save").onclick = function () { readCfgForm(); toast("บันทึกการตั้งค่าแล้ว (โหมด " + CFG.mode + ")"); show("capture"); };
+  $("cfg-reset").onclick = function () {
+    try { localStorage.removeItem(CFG_KEY); } catch (e) {}
+    CFG = deepMerge(DEFAULTS, {}); fillCfgForm(); renderTypeChips(); toast("คืนค่าเริ่มต้นจากไฟล์แล้ว");
+  };
+
+  renderTypeChips(); $("cap-type").textContent = S.tpl.name; renderSteps(0);
+})();
+</script>
+</body>
+</html>
